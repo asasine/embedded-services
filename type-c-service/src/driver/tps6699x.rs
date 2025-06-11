@@ -360,6 +360,11 @@ impl<const N: usize, M: RawMutex, B: I2c> Controller for Tps6699x<'_, N, M, B> {
             fw_version1: customer_use.custom_fw_version(),
         })
     }
+
+    async fn get_dead_battery(&mut self) -> Result<bool, Error<Self::BusError>> {
+        let boot_flags = self.tps6699x.borrow_mut().get_boot_flags().await?;
+        Ok(boot_flags.dead_battery_flag() == 1)
+    }
 }
 
 /// TPS66994 controller wrapper

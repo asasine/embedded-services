@@ -370,6 +370,9 @@ pub trait Controller {
     fn get_controller_status(
         &mut self,
     ) -> impl Future<Output = Result<ControllerStatus<'static>, Error<Self::BusError>>>;
+
+    /// Get whether the controller was powered from a provider in a dead-battery scenario.
+    fn get_dead_battery(&mut self) -> impl Future<Output = Result<bool, Error<Self::BusError>>>;
 }
 
 /// Internal context for managing PD controllers

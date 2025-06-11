@@ -8,6 +8,7 @@ use embedded_services::power::policy::device::StateKind;
 use embedded_services::power::policy::{self, action};
 use embedded_services::type_c::controller::{self, Controller, PortStatus};
 use embedded_services::type_c::event::{PortEventFlags, PortEventKind};
+use embedded_services::type_c::POWER_CAPABILITY_5V_3A0;
 use embedded_services::{error, info, trace, warn};
 use embedded_usb_pd::{Error, PdError, PortId as LocalPortId};
 
@@ -50,7 +51,7 @@ impl<'a, const N: usize, C: Controller> ControllerWrapper<'a, N, C> {
     /// Handle a plug event
     async fn process_plug_event(
         &self,
-        _controller: &mut C,
+        controller: &mut C,
         power: &policy::device::Device,
         port: LocalPortId,
         status: &PortStatus,
@@ -82,6 +83,28 @@ impl<'a, const N: usize, C: Controller> ControllerWrapper<'a, N, C> {
                 // This should never happen
                 error!("Power device not in detached state");
                 return PdError::InvalidMode.into();
+            }
+
+            // FIXME: if dead-battery flag is set, we mock a ConnectConsumer event to allow the device to start charging
+            let is_dead_battery = controller.get_dead_battery().await.unwrap_or(false);
+            if is_dead_battery {
+                info!("Dead battery detected, connecting consumer.");
+                // TODO: clear dead battery flag with DBfg command?
+                // TODO: more appropriate power capability?
+                //  NOTE: the power capability is not actually used by process_power_command for ConnectConsumer
+                match self
+                    .process_power_command(
+                        controller,
+                        port,
+                        &policy::device::CommandData::ConnectConsumer(POWER_CAPABILITY_5V_3A0),
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("Error connecting consumer when battery is dead: {:?}", e);
+                        Error::Pd(PdError::Failed)
+                    })? {
+                    policy::device::ResponseData::Complete => {}
+                }
             }
         } else {
             info!("Plug removed");
