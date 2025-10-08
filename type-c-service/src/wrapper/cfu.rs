@@ -1,11 +1,18 @@
 //! CFU message bridge
 //! TODO: remove this once we have a more generic FW update implementation
+use crate::wrapper::backing::ControllerState;
 use embassy_futures::select::{select, Either};
-use embedded_cfu_protocol::protocol_definitions::*;
-use embedded_services::cfu::component::{InternalResponseData, RequestData};
-use embedded_services::power;
-use embedded_services::type_c::controller::Controller;
-use embedded_services::{debug, error};
+use embedded_cfu_protocol::protocol_definitions::{
+    CfuUpdateContentResponseStatus, ComponentId, FwUpdateContentCommand, FwUpdateContentHeader,
+    FwUpdateContentResponse, FwUpdateOfferExtended, FwUpdateOfferInformation, FwVerComponentInfo,
+    GetFwVerRespHeaderByte3, GetFwVersionResponse, GetFwVersionResponseHeader, HostToken, OfferRejectReason,
+    OfferStatus, FW_UPDATE_FLAG_FIRST_BLOCK, FW_UPDATE_FLAG_LAST_BLOCK, MAX_CMPT_COUNT,
+};
+use embedded_services::{
+    cfu::component::{InternalResponseData, RequestData},
+    debug, error, power,
+    type_c::{controller::Controller, ControllerId},
+};
 
 use super::message::EventCfu;
 use super::*;
@@ -29,10 +36,79 @@ impl FwUpdateState {
     }
 }
 
-impl<'a, M: RawMutex, C: Controller, V: FwOfferValidator> ControllerWrapper<'a, M, C, V> {
+/// A CFU device that can receive offers, apply updates, and provide version information.
+pub trait Device {
+    /// The component ID of the device.
+    fn component_id(&self) -> ComponentId;
+
+    async fn get_fw_version(&mut self) -> Result<GetFwVersionResponse, InternalResponseData>;
+    async fn handle_offer(&mut self, offer: &FwUpdateOffer) -> Result<FwUpdateOfferResponse, InternalResponseData>;
+    async fn handle_content(
+        &mut self,
+        content: &FwUpdateContentCommand,
+    ) -> Result<FwUpdateContentResponse, InternalResponseData>;
+    async fn abort_update(&mut self) -> Result<(), InternalResponseData>;
+    async fn finalize_update(&mut self) -> Result<(), InternalResponseData>;
+    async fn prepare_for_update(&mut self) -> Result<(), InternalResponseData>;
+    async fn handle_extended_offer(
+        &mut self,
+        offer: &FwUpdateOfferExtended,
+    ) -> Result<FwUpdateOfferResponse, InternalResponseData>;
+    async fn handle_offer_information(
+        &mut self,
+        info: &FwUpdateOfferInformation,
+    ) -> Result<FwUpdateOfferResponse, InternalResponseData>;
+}
+
+struct ControllerWithPortStateAndValidator<'a, C: Controller, V: FwOfferValidator> {
+    component_id: ComponentId,
+    controller_id: ControllerId,
+    power_devices: &'a [power::policy::device::Device],
+    controller: &'a mut C,
+    controller_state: &'a mut ControllerState,
+    fw_version_validator: &'a V,
+    ticker: &'a mut embassy_time::Ticker,
+}
+
+trait FwUpdateContentHeaderExt {
+    /// Is this the first block of the update?
+    fn is_first_block(&self) -> bool;
+
+    /// Is this the last block of the update?
+    fn is_last_block(&self) -> bool;
+}
+
+impl FwUpdateContentHeaderExt for FwUpdateContentHeader {
+    fn is_first_block(&self) -> bool {
+        self.flags & FW_UPDATE_FLAG_FIRST_BLOCK != 0
+    }
+
+    fn is_last_block(&self) -> bool {
+        self.flags & FW_UPDATE_FLAG_LAST_BLOCK != 0
+    }
+}
+
+trait ResultExt<T, E> {
+    /// Maps a `Result<T, E>` to `E` by applying a function to a contained [`Ok`] value, or returning the contained
+    /// [`Err`] value.
+    fn map_or_unwrap_err<F>(self, f: F) -> E
+    where
+        F: FnOnce(T) -> E;
+}
+
+impl<T, E> ResultExt<T, E> for Result<T, E> {
+    fn map_or_unwrap_err<F>(self, f: F) -> E
+    where
+        F: FnOnce(T) -> E,
+    {
+        self.map_or_else(core::convert::identity, f)
+    }
+}
+
+impl<'a, C: Controller, V: FwOfferValidator> ControllerWithPortStateAndValidator<'a, C, V> {
     /// Create a new invalid FW version response
     fn create_invalid_fw_version_response(&self) -> InternalResponseData {
-        let dev_inf = FwVerComponentInfo::new(FwVersion::new(0xffffffff), self.registration.cfu_device.component_id());
+        let dev_inf = FwVerComponentInfo::new(FwVersion::new(0xffffffff), self.component_id());
         let comp_info: [FwVerComponentInfo; MAX_CMPT_COUNT] = [dev_inf; MAX_CMPT_COUNT];
         InternalResponseData::FwVersionResponse(GetFwVersionResponse {
             header: GetFwVersionResponseHeader::new(1, GetFwVerRespHeaderByte3::NoSpecialFlags),
@@ -40,29 +116,6 @@ impl<'a, M: RawMutex, C: Controller, V: FwOfferValidator> ControllerWrapper<'a, 
         })
     }
 
-    /// Process a GetFwVersion command
-    async fn process_get_fw_version(&self, target: &mut C) -> InternalResponseData {
-        let version = match target.get_active_fw_version().await {
-            Ok(v) => v,
-            Err(Error::Pd(e)) => {
-                error!("Failed to get active firmware version: {:?}", e);
-                return self.create_invalid_fw_version_response();
-            }
-            Err(Error::Bus(_)) => {
-                error!("Failed to get active firmware version, bus error");
-                return self.create_invalid_fw_version_response();
-            }
-        };
-
-        let dev_inf = FwVerComponentInfo::new(FwVersion::new(version), self.registration.cfu_device.component_id());
-        let comp_info: [FwVerComponentInfo; MAX_CMPT_COUNT] = [dev_inf; MAX_CMPT_COUNT];
-        InternalResponseData::FwVersionResponse(GetFwVersionResponse {
-            header: GetFwVersionResponseHeader::new(1, GetFwVerRespHeaderByte3::NoSpecialFlags),
-            component_info: comp_info,
-        })
-    }
-
-    /// Create an offer rejection response
     fn create_offer_rejection() -> InternalResponseData {
         InternalResponseData::OfferResponse(FwUpdateOfferResponse::new_with_failure(
             HostToken::Driver,
@@ -70,178 +123,189 @@ impl<'a, M: RawMutex, C: Controller, V: FwOfferValidator> ControllerWrapper<'a, 
             OfferStatus::Reject,
         ))
     }
+}
 
-    /// Process a GiveOffer command
-    async fn process_give_offer(&self, target: &mut C, offer: &FwUpdateOffer) -> InternalResponseData {
-        if offer.component_info.component_id != self.registration.cfu_device.component_id() {
-            return Self::create_offer_rejection();
-        }
-
-        let version = match target.get_active_fw_version().await {
-            Ok(v) => v,
-            Err(Error::Pd(e)) => {
-                error!("Failed to get active firmware version: {:?}", e);
-                return Self::create_offer_rejection();
-            }
-            Err(Error::Bus(_)) => {
-                error!("Failed to get active firmware version, bus error");
-                return Self::create_offer_rejection();
-            }
-        };
-
-        InternalResponseData::OfferResponse(self.fw_version_validator.validate(FwVersion::new(version), offer))
+impl<'a, C: Controller, V: FwOfferValidator> Device for ControllerWithPortStateAndValidator<'a, C, V> {
+    fn component_id(&self) -> ComponentId {
+        self.component_id
     }
 
-    async fn process_abort_update(&self, controller: &mut C, state: &mut dyn DynPortState<'_>) -> InternalResponseData {
-        // abort the update process
-        match controller.abort_fw_update().await {
-            Ok(_) => {
-                debug!("FW update aborted successfully");
-                state.controller_state_mut().fw_update_state = FwUpdateState::Idle;
+    async fn get_fw_version(&mut self) -> Result<GetFwVersionResponse, InternalResponseData> {
+        let version = self.controller.get_active_fw_version().await.map_err(|e| {
+            match e {
+                Error::Bus(_) => error!("Failed to get active firmware version, bus error"),
+                Error::Pd(e) => error!("Failed to get active firmware version: {:?}", e),
             }
-            Err(Error::Pd(e)) => {
-                error!("Failed to abort FW update: {:?}", e);
-                state.controller_state_mut().fw_update_state = FwUpdateState::Recovery;
-            }
-            Err(Error::Bus(_)) => {
-                error!("Failed to abort FW update, bus error");
-                state.controller_state_mut().fw_update_state = FwUpdateState::Recovery;
-            }
-        }
 
-        InternalResponseData::ComponentPrepared
+            self.create_invalid_fw_version_response()
+        })?;
+
+        let dev_inf = FwVerComponentInfo::new(FwVersion::new(version), self.component_id());
+        let comp_info: [FwVerComponentInfo; MAX_CMPT_COUNT] = [dev_inf; MAX_CMPT_COUNT];
+        Ok(GetFwVersionResponse {
+            header: GetFwVersionResponseHeader::new(1, GetFwVerRespHeaderByte3::NoSpecialFlags),
+            component_info: comp_info,
+        })
     }
 
-    /// Process a GiveContent command
-    async fn process_give_content(
-        &self,
-        controller: &mut C,
-        state: &mut dyn DynPortState<'_>,
+    async fn handle_offer(&mut self, offer: &FwUpdateOffer) -> Result<FwUpdateOfferResponse, InternalResponseData> {
+        if offer.component_info.component_id != self.component_id() {
+            return Err(Self::create_offer_rejection());
+        }
+
+        let version = self.controller.get_active_fw_version().await.map_err(|e| {
+            match e {
+                Error::Bus(_) => error!("Failed to get active firmware version, bus error"),
+                Error::Pd(e) => error!("Failed to get active firmware version: {:?}", e),
+            }
+
+            Self::create_offer_rejection()
+        })?;
+
+        Ok(self.fw_version_validator.validate(FwVersion::new(version), offer))
+    }
+
+    async fn handle_content(
+        &mut self,
         content: &FwUpdateContentCommand,
-    ) -> InternalResponseData {
+    ) -> Result<FwUpdateContentResponse, InternalResponseData> {
         let data = &content.data[0..content.header.data_length as usize];
         debug!("Got content {:#?}", content);
-        if content.header.flags & FW_UPDATE_FLAG_FIRST_BLOCK != 0 {
+        if content.header.is_first_block() {
             debug!("Got first block");
 
             // Detach from the power policy so it doesn't attempt to do anything while we are updating
-            let controller_id = self.registration.pd_controller.id();
             let mut detached_all = true;
-            for power in self.registration.power_devices {
-                info!("Controller{}: checking power device", controller_id.0);
-                if power.state().await != power::policy::device::State::Detached {
-                    info!("Controller{}: Detaching power device", controller_id.0);
-                    if let Err(e) = power.detach().await {
-                        error!("Controller{}: Failed to detach power device: {:?}", controller_id.0, e);
-
-                        // Sync to bring the controller to a known state with all services
-                        match self.sync_state_internal(controller, state).await {
-                            Ok(_) => debug!(
-                                "Controller{}: Synced state after detaching power device",
-                                controller_id.0
-                            ),
-                            Err(Error::Pd(e)) => error!(
-                                "Controller{}: Failed to sync state after detaching power device: {:?}",
-                                controller_id.0, e
-                            ),
-                            Err(Error::Bus(_)) => error!(
-                                "Controller{}: Failed to sync state after detaching power device, bus error",
-                                controller_id.0
-                            ),
-                        }
-
-                        detached_all = false;
-                        break;
-                    }
+            for power in self.power_devices {
+                info!("{:?}: detaching power device (if attached)", self.controller_id);
+                if let Err(e) = power.detach().await {
+                    error!("{:?}: Failed to detach power device: {:?}", self.controller_id, e);
+                    // TODO: sync state?
+                    detached_all = false;
+                    break;
                 }
             }
 
             if !detached_all {
                 error!(
-                    "Controller{}: Failed to detach all power devices, rejecting offer",
-                    controller_id.0
+                    "{:?}: Failed to detach all power devices, rejecting offer",
+                    self.controller_id
                 );
-                return InternalResponseData::ContentResponse(FwUpdateContentResponse::new(
+
+                return Err(InternalResponseData::ContentResponse(FwUpdateContentResponse::new(
                     content.header.sequence_num,
                     CfuUpdateContentResponseStatus::ErrorPrepare,
-                ));
+                )));
             }
 
             // Need to start the update
-            self.fw_update_ticker.lock().await.reset();
-            match controller.start_fw_update().await {
-                Ok(_) => {
+            self.ticker.reset();
+            match self.controller.start_fw_update().await {
+                Ok(()) => {
                     debug!("FW update started successfully");
+                    self.controller_state.fw_update_state = FwUpdateState::InProgress(0);
                 }
-                Err(Error::Pd(e)) => {
-                    error!("Failed to start FW update: {:?}", e);
-                    state.controller_state_mut().fw_update_state = FwUpdateState::Recovery;
-                    return InternalResponseData::ContentResponse(FwUpdateContentResponse::new(
+                Err(e) => {
+                    match e {
+                        Error::Pd(e) => error!("Failed to start FW update: {:?}", e),
+                        Error::Bus(_) => error!("Failed to start FW update, bus error"),
+                    }
+
+                    self.controller_state.fw_update_state = FwUpdateState::Recovery;
+                    return Err(InternalResponseData::ContentResponse(FwUpdateContentResponse::new(
                         content.header.sequence_num,
                         CfuUpdateContentResponseStatus::ErrorPrepare,
-                    ));
-                }
-                Err(Error::Bus(_)) => {
-                    error!("Failed to start FW update, bus error");
-                    state.controller_state_mut().fw_update_state = FwUpdateState::Recovery;
-                    return InternalResponseData::ContentResponse(FwUpdateContentResponse::new(
-                        content.header.sequence_num,
-                        CfuUpdateContentResponseStatus::ErrorPrepare,
-                    ));
+                    )));
                 }
             }
-
-            state.controller_state_mut().fw_update_state = FwUpdateState::InProgress(0);
         }
 
-        match controller
+        self.controller
             .write_fw_contents(content.header.firmware_address as usize, data)
             .await
-        {
-            Ok(_) => {
-                debug!("Block written successfully");
-            }
-            Err(Error::Pd(e)) => {
-                error!("Failed to write block: {:?}", e);
-                return InternalResponseData::ContentResponse(FwUpdateContentResponse::new(
-                    content.header.sequence_num,
-                    CfuUpdateContentResponseStatus::ErrorWrite,
-                ));
-            }
-            Err(Error::Bus(_)) => {
-                error!("Failed to write block, bus error");
-                return InternalResponseData::ContentResponse(FwUpdateContentResponse::new(
-                    content.header.sequence_num,
-                    CfuUpdateContentResponseStatus::ErrorWrite,
-                ));
-            }
-        }
+            .map_err(|e| {
+                match e {
+                    Error::Pd(e) => error!("Failed to write block: {:?}", e),
+                    Error::Bus(_) => error!("Failed to write block, bus error"),
+                }
 
-        if content.header.flags & FW_UPDATE_FLAG_LAST_BLOCK != 0 {
-            match controller.finalize_fw_update().await {
-                Ok(_) => {
+                InternalResponseData::ContentResponse(FwUpdateContentResponse::new(
+                    content.header.sequence_num,
+                    CfuUpdateContentResponseStatus::ErrorWrite,
+                ))
+            })?;
+
+        debug!("Block written successfully");
+
+        if content.header.is_last_block() {
+            match self.controller.finalize_fw_update().await {
+                Ok(()) => {
                     debug!("FW update finalized successfully");
-                    state.controller_state_mut().fw_update_state = FwUpdateState::Idle;
+                    self.controller_state.fw_update_state = FwUpdateState::Idle;
                 }
-                Err(Error::Pd(e)) => {
-                    error!("Failed to finalize FW update: {:?}", e);
-                    state.controller_state_mut().fw_update_state = FwUpdateState::Recovery;
-                    return Self::create_offer_rejection();
-                }
-                Err(Error::Bus(_)) => {
-                    error!("Failed to finalize FW update, bus error");
-                    state.controller_state_mut().fw_update_state = FwUpdateState::Recovery;
-                    return Self::create_offer_rejection();
+                Err(e) => {
+                    match e {
+                        Error::Pd(e) => error!("Failed to finalize FW update: {:?}", e),
+                        Error::Bus(_) => error!("Failed to finalize FW update, bus error"),
+                    }
+
+                    self.controller_state.fw_update_state = FwUpdateState::Recovery;
+                    return Err(Self::create_offer_rejection());
                 }
             }
         }
 
-        InternalResponseData::ContentResponse(FwUpdateContentResponse::new(
+        Ok(FwUpdateContentResponse::new(
             content.header.sequence_num,
             CfuUpdateContentResponseStatus::Success,
         ))
     }
 
+    async fn abort_update(&mut self) -> Result<(), InternalResponseData> {
+        // abort the update process
+        match self.controller.abort_fw_update().await {
+            Ok(()) => {
+                self.controller_state.fw_update_state = FwUpdateState::Idle;
+                Ok(())
+            }
+            Err(e) => {
+                match e {
+                    Error::Pd(e) => error!("Failed to abort FW update: {:?}", e),
+                    Error::Bus(_) => error!("Failed to abort FW update, bus error"),
+                }
+
+                self.controller_state.fw_update_state = FwUpdateState::Recovery;
+                Err(InternalResponseData::ComponentPrepared) // TODO: better error?
+            }
+        }
+    }
+
+    async fn finalize_update(&mut self) -> Result<(), InternalResponseData> {
+        // Something about how UEFI calls finalize isn't useful for us, so we finalize when we get the last content block and just no-op here
+        Ok(())
+    }
+
+    async fn prepare_for_update(&mut self) -> Result<(), InternalResponseData> {
+        // Something about how UEFI calls prepare isn't useful for us, so we prepare when we get the first content block and just no-op here
+        Ok(())
+    }
+
+    async fn handle_extended_offer(
+        &mut self,
+        _offer: &FwUpdateOfferExtended,
+    ) -> Result<FwUpdateOfferResponse, InternalResponseData> {
+        Err(Self::create_offer_rejection())
+    }
+
+    async fn handle_offer_information(
+        &mut self,
+        _info: &FwUpdateOfferInformation,
+    ) -> Result<FwUpdateOfferResponse, InternalResponseData> {
+        Err(Self::create_offer_rejection())
+    }
+}
+
+impl<'a, M: RawMutex, C: Controller, V: FwOfferValidator> ControllerWrapper<'a, M, C, V> {
     /// Process a CFU tick
     pub async fn process_cfu_tick(&self, controller: &mut C, state: &mut dyn DynPortState<'_>) {
         match state.controller_state_mut().fw_update_state {
@@ -269,12 +333,12 @@ impl<'a, M: RawMutex, C: Controller, V: FwOfferValidator> ControllerWrapper<'a, 
             Ok(_) => {
                 debug!("FW update aborted successfully");
             }
-            Err(Error::Pd(e)) => {
-                error!("Failed to abort FW update: {:?}", e);
-                return;
-            }
-            Err(Error::Bus(_)) => {
-                error!("Failed to abort FW update, bus error");
+            Err(e) => {
+                match e {
+                    Error::Pd(e) => error!("Failed to abort FW update: {:?}", e),
+                    Error::Bus(_) => error!("Failed to abort FW update, bus error"),
+                }
+
                 return;
             }
         }
@@ -294,38 +358,73 @@ impl<'a, M: RawMutex, C: Controller, V: FwOfferValidator> ControllerWrapper<'a, 
             return InternalResponseData::ComponentBusy;
         }
 
+        let mut ticker = self.fw_update_ticker.lock().await;
+        let mut device = ControllerWithPortStateAndValidator {
+            component_id: self.registration.cfu_device.component_id(),
+            controller_id: self.registration.pd_controller.id(),
+            power_devices: self.registration.power_devices,
+            controller,
+            controller_state: state.controller_state_mut(),
+            fw_version_validator: &self.fw_version_validator,
+            ticker: &mut ticker,
+        };
+
         match command {
             RequestData::FwVersionRequest => {
                 debug!("Got FwVersionRequest");
-                self.process_get_fw_version(controller).await
+                device
+                    .get_fw_version()
+                    .await
+                    .map_or_unwrap_err(InternalResponseData::FwVersionResponse)
             }
             RequestData::GiveOffer(offer) => {
                 debug!("Got GiveOffer");
-                self.process_give_offer(controller, offer).await
+                device
+                    .handle_offer(offer)
+                    .await
+                    .map_or_unwrap_err(InternalResponseData::OfferResponse)
             }
             RequestData::GiveContent(content) => {
                 debug!("Got GiveContent");
-                self.process_give_content(controller, state, content).await
+                device
+                    .handle_content(content)
+                    .await
+                    .map_or_unwrap_err(InternalResponseData::ContentResponse)
             }
             RequestData::AbortUpdate => {
                 debug!("Got AbortUpdate");
-                self.process_abort_update(controller, state).await
+                device.abort_update().await.map_or_unwrap_err(|()| {
+                    debug!("FW update aborted successfully");
+                    InternalResponseData::ComponentPrepared
+                })
             }
             RequestData::FinalizeUpdate => {
                 debug!("Got FinalizeUpdate");
-                InternalResponseData::ComponentPrepared
+                device.finalize_update().await.map_or_unwrap_err(|()| {
+                    debug!("FW update finalized successfully");
+                    InternalResponseData::ComponentPrepared
+                })
             }
             RequestData::PrepareComponentForUpdate => {
                 debug!("Got PrepareComponentForUpdate");
-                InternalResponseData::ComponentPrepared
+                device.prepare_for_update().await.map_or_unwrap_err(|()| {
+                    debug!("Component prepared for update successfully");
+                    InternalResponseData::ComponentPrepared
+                })
             }
-            RequestData::GiveOfferExtended(_) => {
-                debug!("Got GiveExtendedOffer, rejecting");
-                Self::create_offer_rejection()
+            RequestData::GiveOfferExtended(offer) => {
+                debug!("Got GiveExtendedOffer");
+                device
+                    .handle_extended_offer(offer)
+                    .await
+                    .map_or_unwrap_err(InternalResponseData::OfferResponse)
             }
-            RequestData::GiveOfferInformation(_) => {
-                debug!("Got GiveOfferInformation, rejecting");
-                Self::create_offer_rejection()
+            RequestData::GiveOfferInformation(offer_info) => {
+                debug!("Got GiveOfferInformation");
+                device
+                    .handle_offer_information(offer_info)
+                    .await
+                    .map_or_unwrap_err(InternalResponseData::OfferResponse)
             }
         }
     }
