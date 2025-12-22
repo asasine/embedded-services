@@ -623,6 +623,28 @@ impl<M: RawMutex, B: I2c> Controller for Tps6699x<'_, M, B> {
                 let mut dfp_vdo = identity.dfp1_vdo();
                 dfp_vdo.set_host_capability(host_capability);
                 identity.set_dfp1_vdo(dfp_vdo);
+
+                match identity.ufp1_vdo() {
+                    Ok(mut ufp_vdo) => {
+                        let device_capability = embedded_usb_pd::vdm::discover_identity::ufp_vdo::DeviceCapability::new(
+                            host_capability.usb2_0,
+                            host_capability.usb3_2,
+                            host_capability.usb4,
+                        );
+
+                        trace!(
+                            "Setting UFP1 VDO device capability based on host capability: {:?} => {:?}",
+                            host_capability, device_capability
+                        );
+
+                        ufp_vdo.set_device_capability(device_capability);
+                        identity.set_ufp1_vdo(ufp_vdo);
+                    }
+                    Err(e) => {
+                        warn!("Failed to get UFP1 VDO, not setting its device capability: {:?}", e);
+                    }
+                }
+
                 identity.clone()
             })
             .await?;
