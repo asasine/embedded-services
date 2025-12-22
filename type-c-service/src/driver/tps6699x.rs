@@ -80,20 +80,6 @@ impl<'a, M: RawMutex, B: I2c> Tps6699x<'a, M, B> {
     }
 }
 
-bitfield! {
-    /// DFP VDO structure
-    #[derive(Clone, Copy)]
-    struct DfpVdo(u32);
-    impl Debug;
-
-    /// Port number (5 bits)
-    pub u8, port_number, set_port_number: 4, 0;
-    /// Host USB capability (3 bits)
-    pub u8, host_capability, set_host_capability: 26, 24;
-    /// DFP VDO version (3 bits)
-    pub u8, version, set_version: 31, 29;
-}
-
 bitflags! {
     /// DisplayPort Pin Configuration bitmap
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -632,23 +618,11 @@ impl<M: RawMutex, B: I2c> Controller for Tps6699x<'_, M, B> {
         port: LocalPortId,
         host_capability: embedded_usb_pd::vdm::discover_identity::dfp_vdo::HostCapability,
     ) -> Result<(), Error<Self::BusError>> {
-        let mut tx_identity_value = 0;
-
-        if host_capability.usb2_0 {
-            tx_identity_value |= 1 << 0;
-        }
-        if host_capability.usb3_2 {
-            tx_identity_value |= 1 << 1;
-        }
-        if host_capability.usb4 {
-            tx_identity_value |= 1 << 2;
-        }
-
         self.tps6699x
             .modify_tx_identity(port, |identity| {
-                let mut dfp_vdo = DfpVdo(identity.dfp1_vdo());
-                dfp_vdo.set_host_capability(tx_identity_value);
-                identity.set_dfp1_vdo(dfp_vdo.0);
+                let mut dfp_vdo = identity.dfp1_vdo();
+                dfp_vdo.set_host_capability(host_capability);
+                identity.set_dfp1_vdo(dfp_vdo);
                 identity.clone()
             })
             .await?;
