@@ -77,3 +77,9 @@ tps6699x = { git = "https://github.com/OpenDevicePartnership/tps6699x" }
 tokio = { version = "1.42.0" }
 uuid = { version = "=1.17.0", default-features = false }
 zerocopy = "0.8.26"
+
+[patch."https://github.com/OpenDevicePartnership/embedded-usb-pd"]
+embedded-usb-pd = { git = "https://github.com/asasine/embedded-usb-pd", branch = "discover-identity-vdos" }
+
+[patch."https://github.com/OpenDevicePartnership/tps6699x"]
+tps6699x = { git = "https://github.com/asasine/tps6699x", branch = "tx-identity/ufp-and-dfp" }
