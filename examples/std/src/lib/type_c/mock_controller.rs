@@ -6,7 +6,7 @@ use embedded_services::{
     type_c::{
         controller::{
             AttnVdm, ControllerStatus, DpConfig, DpPinConfig, DpStatus, OtherVdm, PdStateMachineConfig, PortStatus,
-            RetimerFwUpdateState, SendVdm, TbtConfig, TypeCStateMachineState, UsbControlConfig,
+            RetimerFwUpdateState, SendVdm, TbtConfig, TypeCStateMachineState,
         },
         event::PortEvent,
     },
@@ -256,12 +256,9 @@ impl embedded_services::type_c::controller::Controller for Controller<'_> {
     async fn set_usb_control(
         &mut self,
         port: LocalPortId,
-        config: UsbControlConfig,
+        host_capability: embedded_usb_pd::vdm::discover_identity::dfp_vdo::HostCapability,
     ) -> Result<(), Error<Self::BusError>> {
-        debug!(
-            "set_usb_control(port: {port:?}, usb2: {}, usb3: {}, usb4: {})",
-            config.usb2_enabled, config.usb3_enabled, config.usb4_enabled
-        );
+        debug!("set_usb_control(port: {port:?}, {:?})", host_capability);
         Ok(())
     }
 

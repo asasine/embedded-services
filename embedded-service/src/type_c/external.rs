@@ -3,9 +3,7 @@ use embedded_usb_pd::{GlobalPortId, LocalPortId, PdError, ucsi};
 
 use crate::type_c::{
     Cached,
-    controller::{
-        PdStateMachineConfig, TbtConfig, TypeCStateMachineState, UsbControlConfig, execute_external_ucsi_command,
-    },
+    controller::{PdStateMachineConfig, TbtConfig, TypeCStateMachineState, execute_external_ucsi_command},
 };
 
 use super::{
@@ -76,7 +74,7 @@ pub enum PortCommandData {
     /// Clear the dead battery flag for the given port.
     ClearDeadBatteryFlag,
     /// Set USB control
-    SetUsbControl(UsbControlConfig),
+    SetUsbControl(embedded_usb_pd::vdm::discover_identity::dfp_vdo::HostCapability),
     /// Send VDM
     SendVdm(SendVdm),
     /// Get DisplayPort status
@@ -365,10 +363,13 @@ pub async fn send_vdm(port: GlobalPortId, tx_vdm: SendVdm) -> Result<(), PdError
 }
 
 /// Set USB control configuration
-pub async fn set_usb_control(port: GlobalPortId, config: UsbControlConfig) -> Result<(), PdError> {
+pub async fn set_usb_control(
+    port: GlobalPortId,
+    host_capability: embedded_usb_pd::vdm::discover_identity::dfp_vdo::HostCapability,
+) -> Result<(), PdError> {
     match execute_external_port_command(Command::Port(PortCommand {
         port,
-        data: PortCommandData::SetUsbControl(config),
+        data: PortCommandData::SetUsbControl(host_capability),
     }))
     .await?
     {

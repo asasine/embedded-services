@@ -13,7 +13,7 @@ use embedded_services::power::policy::PowerCapability;
 use embedded_services::type_c::ATTN_VDM_LEN;
 use embedded_services::type_c::controller::{
     self, AttnVdm, Controller, ControllerStatus, DpPinConfig, OtherVdm, PortStatus, SendVdm, TbtConfig,
-    TypeCStateMachineState, UsbControlConfig,
+    TypeCStateMachineState,
 };
 use embedded_services::type_c::event::PortEvent;
 use embedded_services::{debug, error, trace, type_c, warn};
@@ -630,17 +630,17 @@ impl<M: RawMutex, B: I2c> Controller for Tps6699x<'_, M, B> {
     async fn set_usb_control(
         &mut self,
         port: LocalPortId,
-        config: UsbControlConfig,
+        host_capability: embedded_usb_pd::vdm::discover_identity::dfp_vdo::HostCapability,
     ) -> Result<(), Error<Self::BusError>> {
         let mut tx_identity_value = 0;
 
-        if config.usb2_enabled {
+        if host_capability.usb2_0 {
             tx_identity_value |= 1 << 0;
         }
-        if config.usb3_enabled {
+        if host_capability.usb3_2 {
             tx_identity_value |= 1 << 1;
         }
-        if config.usb4_enabled {
+        if host_capability.usb4 {
             tx_identity_value |= 1 << 2;
         }
 

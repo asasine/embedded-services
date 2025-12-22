@@ -1,7 +1,7 @@
 use embedded_services::{
     debug, error,
     type_c::{
-        controller::{DpConfig, PdStateMachineConfig, TbtConfig, TypeCStateMachineState, UsbControlConfig},
+        controller::{DpConfig, PdStateMachineConfig, TbtConfig, TypeCStateMachineState},
         external,
     },
 };
@@ -166,9 +166,9 @@ impl<'a> Service<'a> {
     async fn process_set_usb_control(
         &self,
         port_id: GlobalPortId,
-        config: UsbControlConfig,
+        host_capability: embedded_usb_pd::vdm::discover_identity::dfp_vdo::HostCapability,
     ) -> external::Response<'static> {
-        let status = self.context.set_usb_control(port_id, config).await;
+        let status = self.context.set_usb_control(port_id, host_capability).await;
         if let Err(e) = status {
             error!("Error setting USB control: {:#?}", e);
         }

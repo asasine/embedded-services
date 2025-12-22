@@ -209,28 +209,6 @@ impl Default for SendVdm {
     }
 }
 
-/// USB control configuration
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct UsbControlConfig {
-    /// Enable USB2 data path
-    pub usb2_enabled: bool,
-    /// Enable USB3 data path  
-    pub usb3_enabled: bool,
-    /// Enable USB4 data path
-    pub usb4_enabled: bool,
-}
-
-impl Default for UsbControlConfig {
-    fn default() -> Self {
-        Self {
-            usb2_enabled: true,
-            usb3_enabled: true,
-            usb4_enabled: true,
-        }
-    }
-}
-
 /// Thunderbolt control configuration
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Default, Copy, PartialEq)]
@@ -294,7 +272,7 @@ pub enum PortCommandData {
     /// Send VDM
     SendVdm(SendVdm),
     /// Set USB control configuration
-    SetUsbControl(UsbControlConfig),
+    SetUsbControl(embedded_usb_pd::vdm::discover_identity::dfp_vdo::HostCapability),
     /// Get DisplayPort status
     GetDpStatus,
     /// Set DisplayPort configuration
@@ -626,7 +604,7 @@ pub trait Controller {
     fn set_usb_control(
         &mut self,
         port: LocalPortId,
-        config: UsbControlConfig,
+        host_capability: embedded_usb_pd::vdm::discover_identity::dfp_vdo::HostCapability,
     ) -> impl Future<Output = Result<(), Error<Self::BusError>>>;
 
     /// Get DisplayPort status for the given port
@@ -1116,9 +1094,13 @@ impl ContextToken {
     }
 
     /// Set USB control configuration for the given port
-    pub async fn set_usb_control(&self, port: GlobalPortId, config: UsbControlConfig) -> Result<(), PdError> {
+    pub async fn set_usb_control(
+        &self,
+        port: GlobalPortId,
+        host_capability: embedded_usb_pd::vdm::discover_identity::dfp_vdo::HostCapability,
+    ) -> Result<(), PdError> {
         match self
-            .send_port_command(port, PortCommandData::SetUsbControl(config))
+            .send_port_command(port, PortCommandData::SetUsbControl(host_capability))
             .await?
         {
             PortResponseData::Complete => Ok(()),
